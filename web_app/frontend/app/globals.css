@@ -1,0 +1,323 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #05070a;
+  color: white;
+  font-family: Arial, sans-serif;
+}
+
+.container {
+  min-height: 100vh;
+  padding: 25px;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 25px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 30px;
+}
+
+.header p {
+  color: #888;
+  margin-top: 8px;
+}
+
+.status {
+  padding: 10px 18px;
+  border-radius: 20px;
+  background: #2b1515;
+  color: #ff5555;
+}
+
+.status.online {
+  background: #102a18;
+  color: #35e879;
+}
+
+.camera-section {
+  display: flex;
+  justify-content: center;
+}
+
+.camera-box {
+  position: relative;
+  width: min(100%, 1000px);
+  aspect-ratio: 16 / 9;
+  background: black;
+  border: 1px solid #333;
+  overflow: hidden;
+  border-radius: 12px;
+}
+
+.camera {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.camera-placeholder {
+  position: absolute;
+  inset: 0;
+
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+
+  background: #080b10;
+}
+
+.camera-placeholder h2 {
+  margin-bottom: 5px;
+}
+
+.camera-placeholder p {
+  color: #888;
+}
+
+button {
+  margin-top: 15px;
+  padding: 13px 25px;
+
+  border: none;
+  border-radius: 8px;
+
+  background: #ffffff;
+  color: #000;
+
+  font-weight: bold;
+  cursor: pointer;
+}
+
+button:hover {
+  opacity: 0.8;
+}
+
+.box {
+  position: absolute;
+  border: 3px solid;
+  pointer-events: none;
+}
+
+.box.safe {
+  border-color: #35e879;
+}
+
+.box.warning {
+  border-color: #ffcc00;
+}
+
+.box.danger {
+  border-color: #ff4444;
+}
+
+.label {
+  position: absolute;
+  left: -3px;
+  top: -27px;
+
+  padding: 5px 8px;
+
+  background: rgba(0, 0, 0, 0.85);
+
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.dashboard {
+  margin-top: 25px;
+
+  display: grid;
+  grid-template-columns:
+    repeat(auto-fit, minmax(150px, 1fr));
+
+  gap: 15px;
+}
+
+.card {
+  background: #10141b;
+  border: 1px solid #252b34;
+
+  border-radius: 10px;
+
+  padding: 18px;
+}
+
+.card h3 {
+  margin: 0 0 10px;
+
+  color: #888;
+  font-size: 14px;
+}
+
+.card strong {
+  font-size: 28px;
+}
+
+.danger-card {
+  border-color: #ff4444;
+}
+
+.warning-card {
+  border-color: #ffcc00;
+}
+
+.safe-card {
+  border-color: #35e879;
+}
+
+.objects {
+  margin-top: 30px;
+}
+
+.spatial-map {
+  margin-top: 25px;
+  padding: 20px;
+  background: #10141b;
+  border: 1px solid #252b34;
+  border-radius: 10px;
+}
+
+.section-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.section-heading h2 {
+  margin: 0;
+}
+
+.section-heading span {
+  color: #888;
+  font-size: 13px;
+}
+
+.lidar-status.connected { color: #35e879; }
+
+.map-grid {
+  position: relative;
+  min-height: 360px;
+  overflow: hidden;
+  border: 1px solid #252b34;
+  background: linear-gradient(#0c1118, #080b10);
+}
+
+.map-ring {
+  position: absolute;
+  left: 8%;
+  right: 8%;
+  height: 120px;
+  border: 1px solid #28323d;
+  border-radius: 50% 50% 0 0;
+}
+
+.map-ring span {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  color: #697887;
+  font-size: 11px;
+}
+
+.map-axis {
+  position: absolute;
+  top: 14px;
+  color: #697887;
+  font-size: 11px;
+}
+
+.axis-left { left: 14px; }
+.axis-right { right: 14px; }
+
+.map-you,
+.map-object {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  transform: translate(-50%, 50%);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.map-you {
+  left: 50%;
+  bottom: 3%;
+  width: 42px;
+  height: 26px;
+  background: #e7edf2;
+  color: #0a0d11;
+}
+
+.map-object {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  color: #071009;
+}
+
+.map-object.safe { background: #35e879; }
+.map-object.warning { background: #ffcc00; }
+.map-object.danger { background: #ff4444; }
+
+.lidar-cell {
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  transform: translate(-50%, 50%);
+  background: #72b7ff;
+}
+
+.lidar-cell.obstacle { background: #ff8f5a; }
+
+@media (max-width: 600px) {
+  .container { padding: 16px; }
+  .header { align-items: flex-start; gap: 14px; flex-direction: column; }
+  .header h1 { font-size: 24px; }
+  .status { align-self: stretch; text-align: center; }
+  .map-grid { min-height: 280px; }
+  .section-heading { align-items: flex-start; flex-direction: column; gap: 5px; }
+}
+
+.objects h2 {
+  margin-bottom: 15px;
+}
+
+.object-grid {
+  display: grid;
+  grid-template-columns:
+    repeat(auto-fit, minmax(220px, 1fr));
+
+  gap: 15px;
+}
+
+.object-card {
+  background: #10141b;
+
+  border: 1px solid #252b34;
+
+  border-radius: 10px;
+
+  padding: 15px;
+}
+
+.object-card h3 {
+  margin-top: 0;
+}
+
+.object-card p {
+  color: #aaa;
+}

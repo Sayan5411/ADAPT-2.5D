@@ -1,0 +1,40 @@
+# Python environments and caches
+.venv/
+venv/
+**/__pycache__/
+*.py[cod]
+*.pyo
+**/.git.parent-upload-backup/
+
+# Node / Next.js generated files
+web_app/frontend/node_modules/
+web_app/frontend/.next/
+web_app/frontend/out/
+npm-debug.log*
+
+# Local databases and environment files
+*.db
+.env
+.env.*
+!.env.example
+
+# Generated calibration and runtime output
+object_detection/focal_length.txt
+object_detection/predictions/
+object_detection/test_results/
+object_detection/videos/visualized/
+object_detection/videos/
+object_detection/visualized/
+object_detection/runs/
+
+# Large local datasets and generated media
+object_detection/data_object_calib/
+object_detection/data_object_image_2/
+object_detection/data_object_image_3/
+object_detection/data_object_label_2/
+object_detection/dataset/
+
+# Local model weights; keep repository lightweight
+*.pt
+*.onnx
+*.engine
