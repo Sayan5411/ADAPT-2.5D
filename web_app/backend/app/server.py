@@ -1,5 +1,6 @@
 import base64
 import time
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -16,6 +17,7 @@ from .config import (
     MODEL_PATH,
     NORMAL_IMAGE_SIZE,
 )
+
 from .distance import estimate_distance
 from .lidar_pipeline import LiDARPipeline
 from .risk import calculate_risk
@@ -26,7 +28,9 @@ from .risk import calculate_risk
 # ============================================================
 
 app = FastAPI(
-    title="Adaptive 2.5D LiDAR Mapping API"
+    title="Adaptive 2.5D LiDAR Mapping API",
+    description="Dynamic Environment Perception using YOLO, ByteTrack and LiDAR",
+    version="1.0.0",
 )
 
 
@@ -34,17 +38,27 @@ app = FastAPI(
 # YOLO MODEL
 # ============================================================
 
-print("=" * 60)
-print("Loading YOLO model...")
-print(MODEL_PATH)
-print("=" * 60)
+print("=" * 70)
+print("STARTING ADAPTIVE 2.5D LIDAR MAPPING BACKEND")
+print("=" * 70)
 
-model = YOLO(MODEL_PATH)
+print("Loading YOLO model...")
+print("Model path:", MODEL_PATH)
+
+try:
+    model = YOLO(MODEL_PATH)
+    print("YOLO model loaded successfully")
+except Exception as error:
+    print("ERROR loading YOLO model:")
+    print(repr(error))
+    raise
+
 
 print("Inference device:", DEVICE)
 
 if torch.cuda.is_available():
     print("CUDA GPU detected")
+    print("GPU:", torch.cuda.get_device_name(0))
 else:
     print("CUDA GPU not detected - using CPU")
 
@@ -53,11 +67,43 @@ else:
 # CLASS NAMES
 # ============================================================
 
+# Use configured class names first.
+# If unavailable, fall back to the names stored in the YOLO model.
+
+try:
+    MODEL_CLASS_NAMES = model.names
+except Exception:
+    MODEL_CLASS_NAMES = {}
+
+
+def get_class_name(class_id: int) -> str:
+    """
+    Safely convert YOLO class ID into a class name.
+    """
+
+    # First use project configuration.
+    if 0 <= class_id < len(CLASS_NAMES):
+        return CLASS_NAMES[class_id]
+
+    # Then try YOLO model names.
+    try:
+        if isinstance(MODEL_CLASS_NAMES, dict):
+            return str(MODEL_CLASS_NAMES.get(class_id, "Unknown"))
+
+        if isinstance(MODEL_CLASS_NAMES, list):
+            if 0 <= class_id < len(MODEL_CLASS_NAMES):
+                return str(MODEL_CLASS_NAMES[class_id])
+
+    except Exception:
+        pass
+
+    return "Unknown"
+
+
 # ============================================================
 # ADAPTIVE RESOLUTION
 # ============================================================
 
-# Current resolution used by inference
 current_inference_size = NORMAL_IMAGE_SIZE
 
 
@@ -65,13 +111,57 @@ current_inference_size = NORMAL_IMAGE_SIZE
 # TRACK HISTORY
 # ============================================================
 
-# Stores:
 # track_id -> {
-#     distance,
-#     time
+#     "distance": float,
+#     "time": float
 # }
-track_history = {}
-lidar_pipeline = LiDARPipeline()
+
+track_history: Dict[int, Dict[str, float]] = {}
+
+MAX_TRACK_HISTORY = 500
+
+
+# ============================================================
+# LIDAR
+# ============================================================
+
+try:
+    lidar_pipeline = LiDARPipeline()
+    print("LiDAR pipeline initialized successfully")
+except Exception as error:
+    print("WARNING: LiDAR pipeline initialization failed:")
+    print(repr(error))
+    lidar_pipeline = None
+
+
+def get_latest_lidar() -> Dict[str, Any]:
+    """
+    Safely return the latest LiDAR state.
+    """
+
+    default_lidar = {
+        "connected": False,
+        "points": [],
+        "point_count": 0,
+        "grid": [],
+        "elevation": [],
+        "traversability": [],
+    }
+
+    if lidar_pipeline is None:
+        return default_lidar
+
+    try:
+        latest = getattr(lidar_pipeline, "latest", None)
+
+        if latest is None:
+            return default_lidar
+
+        return latest
+
+    except Exception as error:
+        print("LiDAR latest-state error:", repr(error))
+        return default_lidar
 
 
 # ============================================================
@@ -89,41 +179,141 @@ def root():
         "device": str(DEVICE),
         "endpoint": "/ws/detection",
         "lidar_endpoint": "/ws/lidar",
+        "confidence": CONFIDENCE_THRESHOLD,
+        "normal_resolution": NORMAL_IMAGE_SIZE,
+        "high_resolution": HIGH_IMAGE_SIZE,
     }
 
 
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "device": str(DEVICE),
+        "cuda_available": torch.cuda.is_available(),
+        "tracking": "ByteTrack",
+        "adaptive_resolution": True,
+        "lidar_available": lidar_pipeline is not None,
+    }
+
+
+# ============================================================
+# LIDAR WEBSOCKET
+# ============================================================
+
 @app.websocket("/ws/lidar")
 async def lidar_websocket(websocket: WebSocket):
+
     await websocket.accept()
+
+    print("=" * 70)
     print("LiDAR client connected")
+    print("=" * 70)
 
     try:
+
         while True:
+
             payload = await websocket.receive_json()
-            if not isinstance(payload, dict) or "points" not in payload:
-                await websocket.send_json({"error": "Expected a JSON object with a points array"})
+
+            if not isinstance(payload, dict):
+                await websocket.send_json(
+                    {
+                        "error": "Expected a JSON object"
+                    }
+                )
+                continue
+
+            if "points" not in payload:
+
+                await websocket.send_json(
+                    {
+                        "error": "Expected a JSON object with a points array"
+                    }
+                )
+
+                continue
+
+            if lidar_pipeline is None:
+
+                await websocket.send_json(
+                    {
+                        "error": "LiDAR pipeline is unavailable"
+                    }
+                )
+
                 continue
 
             try:
+
                 result = lidar_pipeline.process_frame(
                     payload["points"],
                     payload.get("labels"),
                 )
+
             except (TypeError, ValueError) as error:
-                await websocket.send_json({"error": str(error)})
+
+                print(
+                    "LiDAR processing validation error:",
+                    repr(error)
+                )
+
+                await websocket.send_json(
+                    {
+                        "error": str(error)
+                    }
+                )
+
+                continue
+
+            except Exception as error:
+
+                print(
+                    "LiDAR processing error:",
+                    repr(error)
+                )
+
+                await websocket.send_json(
+                    {
+                        "error": "LiDAR processing failed"
+                    }
+                )
+
                 continue
 
             await websocket.send_json(result)
+
     except WebSocketDisconnect:
-        lidar_pipeline.disconnect()
+
+        if lidar_pipeline is not None:
+
+            try:
+                lidar_pipeline.disconnect()
+            except Exception:
+                pass
+
         print("LiDAR client disconnected")
+
     except Exception as error:
-        lidar_pipeline.disconnect()
+
+        if lidar_pipeline is not None:
+
+            try:
+                lidar_pipeline.disconnect()
+            except Exception:
+                pass
+
         print("LiDAR websocket error:", repr(error))
 
 
 # ============================================================
-# WEBSOCKET
+# DETECTION WEBSOCKET
 # ============================================================
 
 @app.websocket("/ws/detection")
@@ -133,422 +323,675 @@ async def detection_websocket(
 
     global current_inference_size
 
+    # --------------------------------------------------------
+    # ACCEPT CONNECTION
+    # --------------------------------------------------------
+
     await websocket.accept()
 
-    print("Frontend connected")
-
-    previous_frame_time = time.time()
+    client_host = "unknown"
 
     try:
 
+        if websocket.client is not None:
+            client_host = websocket.client.host
+
+    except Exception:
+        pass
+
+    print("=" * 70)
+    print("Frontend connected")
+    print("Client:", client_host)
+    print("WebSocket endpoint: /ws/detection")
+    print("=" * 70)
+
+    previous_frame_time = time.time()
+
+    frame_number = 0
+
+    try:
+
+        # ====================================================
+        # MAIN LOOP
+        # ====================================================
+
         while True:
+
+            frame_number += 1
+
+            frame_start_time = time.time()
 
             # ====================================================
             # RECEIVE IMAGE
             # ====================================================
 
-            data = await websocket.receive_text()
-
-            # Remove data URL prefix
-            if "," in data:
-                data = data.split(",", 1)[1]
-
             try:
 
-                image_bytes = base64.b64decode(data)
+                data = await websocket.receive_text()
 
-            except Exception:
+            except WebSocketDisconnect:
 
-                print("Invalid base64 image")
+                raise
+
+            except Exception as error:
+
+                print(
+                    "ERROR receiving frame:",
+                    repr(error)
+                )
+
+                continue
+
+            print(
+                f"[FRAME {frame_number}] FRAME RECEIVED | "
+                f"data_length={len(data)}"
+            )
+
+            # ====================================================
+            # VALIDATE RECEIVED DATA
+            # ====================================================
+
+            if not data:
+
+                print(
+                    f"[FRAME {frame_number}] Empty frame received"
+                )
+
                 continue
 
             # ====================================================
-            # BASE64 -> OPENCV IMAGE
+            # REMOVE DATA URL PREFIX
             # ====================================================
 
-            np_array = np.frombuffer(
-                image_bytes,
-                np.uint8
+            if "," in data:
+
+                data = data.split(",", 1)[1]
+
+            # ====================================================
+            # BASE64 -> BYTES
+            # ====================================================
+
+            try:
+
+                image_bytes = base64.b64decode(
+                    data,
+                    validate=True
+                )
+
+            except Exception as error:
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    f"Invalid base64 image: {repr(error)}"
+                )
+
+                continue
+
+            if not image_bytes:
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    "Decoded image is empty"
+                )
+
+                continue
+
+            print(
+                f"[FRAME {frame_number}] "
+                f"Base64 decoded | bytes={len(image_bytes)}"
             )
 
-            frame = cv2.imdecode(
-                np_array,
-                cv2.IMREAD_COLOR
-            )
+            # ====================================================
+            # BYTES -> NUMPY
+            # ====================================================
+
+            try:
+
+                np_array = np.frombuffer(
+                    image_bytes,
+                    np.uint8
+                )
+
+            except Exception as error:
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    f"NumPy conversion failed: {repr(error)}"
+                )
+
+                continue
+
+            # ====================================================
+            # NUMPY -> OPENCV IMAGE
+            # ====================================================
+
+            try:
+
+                frame = cv2.imdecode(
+                    np_array,
+                    cv2.IMREAD_COLOR
+                )
+
+            except Exception as error:
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    f"OpenCV decode error: {repr(error)}"
+                )
+
+                continue
 
             if frame is None:
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    "OpenCV returned None"
+                )
+
                 continue
 
             height, width = frame.shape[:2]
 
+            print(
+                f"[FRAME {frame_number}] "
+                f"IMAGE DECODED | {width}x{height}"
+            )
 
             # ====================================================
             # YOLO + BYTE TRACK
             # ====================================================
 
-            results = model.track(
-
-                frame,
-
-                persist=True,
-
-                tracker="bytetrack.yaml",
-
-                conf=CONFIDENCE_THRESHOLD,
-
-                imgsz=current_inference_size,
-
-                device=DEVICE,
-
-                verbose=False
+            print(
+                f"[FRAME {frame_number}] "
+                f"RUNNING YOLO | imgsz={current_inference_size}"
             )
 
+            yolo_start_time = time.time()
 
-            objects = []
+            try:
+
+                results = model.track(
+
+                    frame,
+
+                    persist=True,
+
+                    tracker="bytetrack.yaml",
+
+                    conf=CONFIDENCE_THRESHOLD,
+
+                    imgsz=current_inference_size,
+
+                    device=DEVICE,
+
+                    verbose=False,
+
+                )
+
+            except Exception as error:
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    "YOLO ERROR:",
+                    repr(error)
+                )
+
+                # Keep WebSocket alive instead of killing it.
+                try:
+
+                    await websocket.send_json(
+                        {
+                            "objects": [],
+                            "counts": {
+                                "danger": 0,
+                                "warning": 0,
+                                "safe": 0,
+                                "total": 0,
+                            },
+                            "fps": 0,
+                            "inference_size": current_inference_size,
+                            "image": {
+                                "width": width,
+                                "height": height,
+                            },
+                            "map": [],
+                            "camera": {
+                                "width": width,
+                                "height": height,
+                                "connected": True,
+                            },
+                            "lidar": get_latest_lidar(),
+                            "system": {
+                                "device": str(DEVICE),
+                                "model": "YOLO",
+                                "tracker": "ByteTrack",
+                                "adaptive_resolution": True,
+                                "error": "YOLO inference failed",
+                            },
+                        }
+                    )
+
+                except Exception:
+                    pass
+
+                continue
+
+            yolo_time = time.time() - yolo_start_time
+
+            print(
+                f"[FRAME {frame_number}] "
+                f"YOLO FINISHED | "
+                f"time={yolo_time:.3f}s"
+            )
+
+            # ====================================================
+            # DETECTION RESULT CONTAINER
+            # ====================================================
+
+            objects: List[Dict[str, Any]] = []
 
             current_track_ids = set()
 
             current_time = time.time()
 
-
             # ====================================================
-            # PROCESS DETECTIONS
+            # PROCESS YOLO RESULTS
             # ====================================================
 
             if (
                 results
+                and len(results) > 0
                 and results[0].boxes is not None
             ):
 
                 boxes = results[0].boxes
 
+                detection_count = len(boxes)
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    f"YOLO DETECTIONS: {detection_count}"
+                )
+
+                # ------------------------------------------------
+                # PROCESS EACH OBJECT
+                # ------------------------------------------------
 
                 for i in range(len(boxes)):
 
-                    box = boxes[i]
+                    try:
 
+                        box = boxes[i]
 
-                    # ------------------------------------------------
-                    # BOUNDING BOX
-                    # ------------------------------------------------
+                        # ========================================
+                        # BOUNDING BOX
+                        # ========================================
 
-                    x1, y1, x2, y2 = (
-                        box.xyxy[0]
-                        .cpu()
-                        .numpy()
-                    )
-
-                    x1 = int(x1)
-                    y1 = int(y1)
-                    x2 = int(x2)
-                    y2 = int(y2)
-
-
-                    # ------------------------------------------------
-                    # CONFIDENCE
-                    # ------------------------------------------------
-
-                    confidence = float(
-                        box.conf[0]
-                    )
-
-
-                    # ------------------------------------------------
-                    # CLASS
-                    # ------------------------------------------------
-
-                    class_id = int(
-                        box.cls[0]
-                    )
-
-                    if (
-                        class_id >= 0
-                        and class_id < len(CLASS_NAMES)
-                    ):
-
-                        class_name = (
-                            CLASS_NAMES[class_id]
+                        x1, y1, x2, y2 = (
+                            box.xyxy[0]
+                            .detach()
+                            .cpu()
+                            .numpy()
                         )
 
-                    else:
+                        x1 = int(x1)
+                        y1 = int(y1)
+                        x2 = int(x2)
+                        y2 = int(y2)
 
-                        class_name = "Unknown"
+                        # ========================================
+                        # CONFIDENCE
+                        # ========================================
 
-
-                    # ------------------------------------------------
-                    # TRACK ID
-                    # ------------------------------------------------
-
-                    track_id = None
-
-                    if boxes.id is not None:
-
-                        track_id = int(
-                            boxes.id[i]
+                        confidence = float(
+                            box.conf[0]
+                            .detach()
+                            .cpu()
                             .item()
                         )
 
-                        current_track_ids.add(
-                            track_id
+                        # ========================================
+                        # CLASS
+                        # ========================================
+
+                        class_id = int(
+                            box.cls[0]
+                            .detach()
+                            .cpu()
+                            .item()
                         )
 
+                        class_name = get_class_name(
+                            class_id
+                        )
 
-                    # ------------------------------------------------
-                    # OBJECT WIDTH
-                    # ------------------------------------------------
+                        # ========================================
+                        # TRACK ID
+                        # ========================================
 
-                    pixel_width = max(
-                        1,
-                        x2 - x1
-                    )
+                        track_id: Optional[int] = None
 
+                        if boxes.id is not None:
 
-                    # ------------------------------------------------
-                    # DISTANCE
-                    # ------------------------------------------------
+                            try:
 
-                    distance = estimate_distance(
+                                track_id = int(
+                                    boxes.id[i]
+                                    .detach()
+                                    .cpu()
+                                    .item()
+                                )
 
-                        class_name,
+                                current_track_ids.add(
+                                    track_id
+                                )
 
-                        pixel_width
+                            except Exception:
 
-                    )
+                                track_id = None
 
+                        # ========================================
+                        # OBJECT WIDTH
+                        # ========================================
 
-                    # =================================================
-                    # SPEED / APPROACHING / TTC
-                    # =================================================
+                        pixel_width = max(
+                            1,
+                            x2 - x1
+                        )
 
-                    speed = 0.0
+                        # ========================================
+                        # DISTANCE
+                        # ========================================
 
-                    approaching = False
+                        try:
 
-                    ttc = None
+                            distance = float(
+                                estimate_distance(
+                                    class_name,
+                                    pixel_width
+                                )
+                            )
 
+                        except Exception as error:
 
-                    if track_id is not None:
+                            print(
+                                f"[FRAME {frame_number}] "
+                                f"Distance estimation error "
+                                f"for {class_name}:",
+                                repr(error)
+                            )
 
-                        previous = (
-                            track_history.get(
+                            distance = 0.0
+
+                        # ========================================
+                        # SPEED
+                        # ========================================
+
+                        speed = 0.0
+
+                        approaching = False
+
+                        ttc = None
+
+                        # ========================================
+                        # TRACK HISTORY
+                        # ========================================
+
+                        if track_id is not None:
+
+                            previous = track_history.get(
                                 track_id
                             )
-                        )
 
+                            if previous is not None:
 
-                        if previous is not None:
-
-                            previous_distance = (
-                                previous["distance"]
-                            )
-
-                            previous_time = (
-                                previous["time"]
-                            )
-
-                            delta_time = (
-                                current_time
-                                - previous_time
-                            )
-
-
-                            if delta_time > 0:
-
-                                # Positive = approaching
-                                distance_change = (
-                                    previous_distance
-                                    - distance
+                                previous_distance = float(
+                                    previous["distance"]
                                 )
 
-                                speed = (
-                                    distance_change
-                                    / delta_time
+                                previous_time = float(
+                                    previous["time"]
                                 )
 
+                                delta_time = (
+                                    current_time
+                                    - previous_time
+                                )
 
-                                # Ignore tiny movements
-                                if speed > 0.15:
+                                if delta_time > 0:
 
-                                    approaching = True
+                                    # Positive means object
+                                    # is getting closer.
 
-
-                                # TTC
-                                if (
-                                    approaching
-                                    and speed > 0.1
-                                ):
-
-                                    ttc = (
-                                        distance
-                                        / speed
+                                    distance_change = (
+                                        previous_distance
+                                        - distance
                                     )
 
+                                    speed = (
+                                        distance_change
+                                        / delta_time
+                                    )
 
-                        # Save current state
-                        track_history[
-                            track_id
-                        ] = {
+                                    # Ignore very small movement.
 
-                            "distance": distance,
+                                    if speed > 0.15:
 
-                            "time": current_time
+                                        approaching = True
 
-                        }
+                                    # =================================
+                                    # TIME TO COLLISION
+                                    # =================================
 
+                                    if (
+                                        approaching
+                                        and speed > 0.1
+                                        and distance > 0
+                                    ):
 
-                    # =================================================
-                    # RISK
-                    # =================================================
+                                        ttc = (
+                                            distance
+                                            / speed
+                                        )
 
-                    risk = calculate_risk(
+                            # Save current track state.
 
-                        distance,
+                            track_history[track_id] = {
 
-                        ttc
+                                "distance": distance,
 
-                    )
+                                "time": current_time,
 
+                            }
 
-                    # =================================================
-                    # OBJECT CENTER
-                    # =================================================
+                        # ========================================
+                        # RISK
+                        # ========================================
 
-                    center_x = (
-                        x1 + x2
-                    ) / 2
+                        try:
 
-                    center_y = (
-                        y1 + y2
-                    ) / 2
+                            risk = calculate_risk(
+                                distance,
+                                ttc
+                            )
 
+                        except Exception as error:
 
-                    # Relative horizontal position
-                    relative_x = (
-                        center_x / width
-                    )
+                            print(
+                                f"[FRAME {frame_number}] "
+                                f"Risk calculation error:",
+                                repr(error)
+                            )
 
+                            risk = "SAFE"
 
-                    # Relative vertical position
-                    relative_y = (
-                        center_y / height
-                    )
+                        # ========================================
+                        # CENTER
+                        # ========================================
 
+                        center_x = (
+                            x1 + x2
+                        ) / 2
 
-                    # =================================================
-                    # 2.5D POSITION
-                    # =================================================
+                        center_y = (
+                            y1 + y2
+                        ) / 2
 
-                    # Normalize X:
-                    #
-                    # -1 = far left
-                    #  0 = center
-                    # +1 = far right
+                        # ========================================
+                        # RELATIVE POSITION
+                        # ========================================
 
-                    map_x = (
-                        (center_x / width)
-                        * 2
-                        - 1
-                    )
-
-
-                    # =================================================
-                    # OBJECT DATA
-                    # =================================================
-
-                    objects.append({
-
-                        "id": track_id,
-
-                        "class": class_name,
-
-                        "confidence": round(
-                            confidence,
-                            3
-                        ),
-
-                        "x1": x1,
-
-                        "y1": y1,
-
-                        "x2": x2,
-
-                        "y2": y2,
-
-                        "width": x2 - x1,
-
-                        "height": y2 - y1,
-
-                        "center_x": round(
-                            center_x,
-                            1
-                        ),
-
-                        "center_y": round(
-                            center_y,
-                            1
-                        ),
-
-                        "distance": round(
-                            distance,
-                            2
-                        ),
-
-                        "speed": round(
-                            speed,
-                            2
-                        ),
-
-                        "ttc": (
-                            round(ttc, 2)
-                            if ttc is not None
-                            else None
-                        ),
-
-                        "approaching": approaching,
-
-                        "risk": risk,
-
-                        "rel_x": round(
-                            relative_x,
-                            3
-                        ),
-
-                        "rel_y": round(
-                            relative_y,
-                            3
-                        ),
-
-                        "map_x": round(
-                            map_x,
-                            3
-                        ),
-
-                        "map_distance": round(
-                            distance,
-                            2
+                        relative_x = (
+                            center_x / width
+                            if width > 0
+                            else 0
                         )
-                    })
 
+                        relative_y = (
+                            center_y / height
+                            if height > 0
+                            else 0
+                        )
+
+                        # ========================================
+                        # 2.5D MAP X
+                        # ========================================
+
+                        map_x = (
+                            (
+                                center_x / width
+                            ) * 2
+                            - 1
+                            if width > 0
+                            else 0
+                        )
+
+                        # ========================================
+                        # OBJECT DATA
+                        # ========================================
+
+                        objects.append({
+
+                            "id": track_id,
+
+                            "class": class_name,
+
+                            "class_id": class_id,
+
+                            "confidence": round(
+                                confidence,
+                                3
+                            ),
+
+                            "x1": x1,
+
+                            "y1": y1,
+
+                            "x2": x2,
+
+                            "y2": y2,
+
+                            "width": x2 - x1,
+
+                            "height": y2 - y1,
+
+                            "center_x": round(
+                                center_x,
+                                1
+                            ),
+
+                            "center_y": round(
+                                center_y,
+                                1
+                            ),
+
+                            "distance": round(
+                                distance,
+                                2
+                            ),
+
+                            "speed": round(
+                                speed,
+                                2
+                            ),
+
+                            "ttc": (
+                                round(ttc, 2)
+                                if ttc is not None
+                                else None
+                            ),
+
+                            "approaching": approaching,
+
+                            "risk": risk,
+
+                            "rel_x": round(
+                                relative_x,
+                                3
+                            ),
+
+                            "rel_y": round(
+                                relative_y,
+                                3
+                            ),
+
+                            "map_x": round(
+                                map_x,
+                                3
+                            ),
+
+                            "map_distance": round(
+                                distance,
+                                2
+                            ),
+
+                        })
+
+                    except Exception as error:
+
+                        print(
+                            f"[FRAME {frame_number}] "
+                            f"Object processing error "
+                            f"at index {i}:",
+                            repr(error)
+                        )
+
+                        continue
+
+            else:
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    "YOLO DETECTIONS: 0"
+                )
 
             # ====================================================
-            # REMOVE OLD TRACKS
+            # LIMIT TRACK HISTORY
             # ====================================================
 
-            old_ids = list(
-                track_history.keys()
-            )
+            if len(track_history) > MAX_TRACK_HISTORY:
 
-            for track_id in old_ids:
+                active_ids = set(
+                    current_track_ids
+                )
 
-                if (
-                    track_id
-                    not in current_track_ids
-                ):
+                old_ids = list(
+                    track_history.keys()
+                )
 
-                    # Keep only recent tracks
-                    # rather than deleting immediately.
-                    pass
+                for track_id in old_ids:
 
+                    if track_id not in active_ids:
+
+                        try:
+                            del track_history[track_id]
+                        except KeyError:
+                            pass
+
+                        if len(track_history) <= (
+                            MAX_TRACK_HISTORY * 0.8
+                        ):
+                            break
 
             # ====================================================
             # COUNTS
@@ -557,32 +1000,38 @@ async def detection_websocket(
             danger_count = sum(
 
                 1
+
                 for obj in objects
 
-                if obj["risk"] == "DANGER"
+                if str(
+                    obj["risk"]
+                ).upper() == "DANGER"
 
             )
-
 
             warning_count = sum(
 
                 1
+
                 for obj in objects
 
-                if obj["risk"] == "WARNING"
+                if str(
+                    obj["risk"]
+                ).upper() == "WARNING"
 
             )
-
 
             safe_count = sum(
 
                 1
+
                 for obj in objects
 
-                if obj["risk"] == "SAFE"
+                if str(
+                    obj["risk"]
+                ).upper() == "SAFE"
 
             )
-
 
             # ====================================================
             # FPS
@@ -598,47 +1047,42 @@ async def detection_websocket(
             fps = (
 
                 1 / elapsed
+
                 if elapsed > 0
+
                 else 0
 
             )
 
             previous_frame_time = now
 
-
             # ====================================================
             # ADAPTIVE RESOLUTION
             # ====================================================
 
-            #
-            # If dangerous objects are detected,
-            # increase the next inference resolution.
-            #
-
             if danger_count > 0:
 
-                    current_inference_size = (
+                current_inference_size = (
                     HIGH_IMAGE_SIZE
                 )
 
             elif warning_count > 0:
 
-                    current_inference_size = (
+                current_inference_size = (
                     HIGH_IMAGE_SIZE
                 )
 
             elif len(objects) >= 6:
 
-                    current_inference_size = (
+                current_inference_size = (
                     HIGH_IMAGE_SIZE
                 )
 
             else:
 
-                    current_inference_size = (
+                current_inference_size = (
                     NORMAL_IMAGE_SIZE
                 )
-
 
             # ====================================================
             # ENVIRONMENT MAP
@@ -664,10 +1108,24 @@ async def detection_websocket(
 
                     "approaching": obj[
                         "approaching"
-                    ]
+                    ],
 
                 })
 
+            # ====================================================
+            # LIDAR
+            # ====================================================
+
+            lidar_data = get_latest_lidar()
+
+            # ====================================================
+            # TOTAL PROCESSING TIME
+            # ====================================================
+
+            total_processing_time = (
+                time.time()
+                - frame_start_time
+            )
 
             # ====================================================
             # RESPONSE
@@ -685,7 +1143,7 @@ async def detection_websocket(
 
                     "safe": safe_count,
 
-                    "total": len(objects)
+                    "total": len(objects),
 
                 },
 
@@ -702,19 +1160,23 @@ async def detection_websocket(
 
                     "width": width,
 
-                    "height": height
+                    "height": height,
 
                 },
 
                 "map": map_objects,
 
                 "camera": {
+
                     "width": width,
+
                     "height": height,
+
                     "connected": True,
+
                 },
 
-                "lidar": lidar_pipeline.latest,
+                "lidar": lidar_data,
 
                 "system": {
 
@@ -724,32 +1186,91 @@ async def detection_websocket(
 
                     "tracker": "ByteTrack",
 
-                    "adaptive_resolution": True
+                    "adaptive_resolution": True,
 
-                }
+                    "frame": frame_number,
+
+                    "yolo_time": round(
+                        yolo_time,
+                        3
+                    ),
+
+                    "processing_time": round(
+                        total_processing_time,
+                        3
+                    ),
+
+                },
 
             }
 
-
             # ====================================================
-            # SEND TO FRONTEND
+            # DEBUG SUMMARY
             # ====================================================
 
-            await websocket.send_json(
-                response
+            print(
+                f"[FRAME {frame_number}] "
+                f"RESULT | "
+                f"objects={len(objects)} | "
+                f"danger={danger_count} | "
+                f"warning={warning_count} | "
+                f"safe={safe_count} | "
+                f"fps={fps:.1f} | "
+                f"next_imgsz={current_inference_size} | "
+                f"total_time={total_processing_time:.3f}s"
             )
 
+            # ====================================================
+            # SEND RESPONSE
+            # ====================================================
+
+            try:
+
+                await websocket.send_json(
+                    response
+                )
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    "SENDING RESPONSE: "
+                    f"{len(objects)} objects"
+                )
+
+            except WebSocketDisconnect:
+
+                raise
+
+            except Exception as error:
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    f"Response send error:",
+                    repr(error)
+                )
+
+                break
+
+    # ============================================================
+    # FRONTEND DISCONNECT
+    # ============================================================
 
     except WebSocketDisconnect:
 
-        print(
-            "Frontend disconnected"
-        )
+        print("=" * 70)
+        print("Frontend disconnected")
+        print("Client:", client_host)
+        print("Frames processed:", frame_number)
+        print("=" * 70)
 
+    # ============================================================
+    # UNEXPECTED WEBSOCKET ERROR
+    # ============================================================
 
-    except Exception as e:
+    except Exception as error:
 
-        print(
-            "WebSocket error:",
-            repr(e)
-        )
+        print("=" * 70)
+        print("WebSocket error")
+        print("Client:", client_host)
+        print("Frames processed:", frame_number)
+        print("ERROR:", repr(error))
+        print("=" * 70)
