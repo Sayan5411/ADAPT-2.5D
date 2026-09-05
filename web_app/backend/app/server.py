@@ -1,6 +1,25 @@
+# ============================================================
+# ADAPTIVE 2.5D LiDAR MAPPING
+# REAL-TIME DETECTION WEBSOCKET BACKEND
+# ============================================================
+#
+# FastAPI + WebSocket
+# YOLO11n + ByteTrack
+# Distance Estimation
+# Speed / Approach Detection
+# TTC Calculation
+# Risk Classification
+# Adaptive Inference Resolution
+# 2.5D Environment Mapping
+# LiDAR Pipeline
+#
+# ============================================================
+
+import asyncio
 import base64
+import binascii
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
@@ -24,101 +43,73 @@ from .risk import calculate_risk
 
 
 # ============================================================
-# FASTAPI
+# APPLICATION
 # ============================================================
 
 app = FastAPI(
     title="Adaptive 2.5D LiDAR Mapping API",
-    description="Dynamic Environment Perception using YOLO, ByteTrack and LiDAR",
     version="1.0.0",
+    description=(
+        "Real-time adaptive 2.5D environment perception "
+        "using YOLO, ByteTrack and LiDAR."
+    ),
 )
+
+
+# ============================================================
+# GLOBAL SETTINGS
+# ============================================================
+
+SERVER_START_TIME = time.time()
+
+# Current inference resolution.
+#
+# Starts at normal resolution.
+# It can automatically increase when the environment becomes
+# more complex or dangerous.
+current_inference_size = NORMAL_IMAGE_SIZE
 
 
 # ============================================================
 # YOLO MODEL
 # ============================================================
 
+print()
 print("=" * 70)
 print("STARTING ADAPTIVE 2.5D LIDAR MAPPING BACKEND")
 print("=" * 70)
 
+print()
 print("Loading YOLO model...")
 print("Model path:", MODEL_PATH)
 
 try:
     model = YOLO(MODEL_PATH)
+
     print("YOLO model loaded successfully")
+
 except Exception as error:
-    print("ERROR loading YOLO model:")
-    print(repr(error))
+    print()
+    print("=" * 70)
+    print("ERROR: YOLO MODEL FAILED TO LOAD")
+    print("=" * 70)
+    print("Model path:", MODEL_PATH)
+    print("Error:", repr(error))
+    print("=" * 70)
     raise
 
 
+# ============================================================
+# DEVICE
+# ============================================================
+
+print()
 print("Inference device:", DEVICE)
 
 if torch.cuda.is_available():
     print("CUDA GPU detected")
-    print("GPU:", torch.cuda.get_device_name(0))
 else:
     print("CUDA GPU not detected - using CPU")
-
-
-# ============================================================
-# CLASS NAMES
-# ============================================================
-
-# Use configured class names first.
-# If unavailable, fall back to the names stored in the YOLO model.
-
-try:
-    MODEL_CLASS_NAMES = model.names
-except Exception:
-    MODEL_CLASS_NAMES = {}
-
-
-def get_class_name(class_id: int) -> str:
-    """
-    Safely convert YOLO class ID into a class name.
-    """
-
-    # First use project configuration.
-    if 0 <= class_id < len(CLASS_NAMES):
-        return CLASS_NAMES[class_id]
-
-    # Then try YOLO model names.
-    try:
-        if isinstance(MODEL_CLASS_NAMES, dict):
-            return str(MODEL_CLASS_NAMES.get(class_id, "Unknown"))
-
-        if isinstance(MODEL_CLASS_NAMES, list):
-            if 0 <= class_id < len(MODEL_CLASS_NAMES):
-                return str(MODEL_CLASS_NAMES[class_id])
-
-    except Exception:
-        pass
-
-    return "Unknown"
-
-
-# ============================================================
-# ADAPTIVE RESOLUTION
-# ============================================================
-
-current_inference_size = NORMAL_IMAGE_SIZE
-
-
-# ============================================================
-# TRACK HISTORY
-# ============================================================
-
-# track_id -> {
-#     "distance": float,
-#     "time": float
-# }
-
-track_history: Dict[int, Dict[str, float]] = {}
-
-MAX_TRACK_HISTORY = 500
 
 
 # ============================================================
@@ -127,19 +118,294 @@ MAX_TRACK_HISTORY = 500
 
 try:
     lidar_pipeline = LiDARPipeline()
+
     print("LiDAR pipeline initialized successfully")
+
 except Exception as error:
-    print("WARNING: LiDAR pipeline initialization failed:")
-    print(repr(error))
+    print("WARNING: LiDAR pipeline initialization failed")
+    print("Error:", repr(error))
+
     lidar_pipeline = None
 
 
-def get_latest_lidar() -> Dict[str, Any]:
+# ============================================================
+# TRACK HISTORY
+# ============================================================
+#
+# track_id -> {
+#     "distance": float,
+#     "time": float,
+# }
+#
+# Used for:
+#
+# distance change
+#       ↓
+# speed
+#       ↓
+# approaching
+#       ↓
+# TTC
+#       ↓
+# risk
+#
+# ============================================================
+
+track_history: Dict[int, Dict[str, float]] = {}
+
+
+# ============================================================
+# YOLO INFERENCE LOCK
+# ============================================================
+#
+# Important for Render.
+#
+# Multiple browser/WebSocket connections can arrive at the
+# backend. YOLO inference is CPU-heavy and the same model should
+# not be executed simultaneously by multiple connections.
+#
+# ============================================================
+
+inference_lock = asyncio.Lock()
+
+
+# ============================================================
+# ACTIVE CONNECTION COUNTER
+# ============================================================
+
+active_detection_connections = 0
+active_lidar_connections = 0
+
+
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
     """
-    Safely return the latest LiDAR state.
+    Safely convert a value to float.
     """
 
-    default_lidar = {
+    try:
+        return float(value)
+
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    """
+    Safely convert a value to int.
+    """
+
+    try:
+        return int(value)
+
+    except (TypeError, ValueError):
+        return default
+
+
+def decode_base64_image(data: str) -> Optional[np.ndarray]:
+    """
+    Convert a base64/data-URL image into an OpenCV frame.
+    """
+
+    if not data:
+        return None
+
+    try:
+
+        # --------------------------------------------------------
+        # Remove data URL prefix
+        # --------------------------------------------------------
+
+        if "," in data:
+            data = data.split(",", 1)[1]
+
+        # --------------------------------------------------------
+        # Decode base64
+        # --------------------------------------------------------
+
+        image_bytes = base64.b64decode(
+            data,
+            validate=True,
+        )
+
+        if not image_bytes:
+            return None
+
+        # --------------------------------------------------------
+        # Bytes -> NumPy
+        # --------------------------------------------------------
+
+        np_array = np.frombuffer(
+            image_bytes,
+            dtype=np.uint8,
+        )
+
+        # --------------------------------------------------------
+        # NumPy -> OpenCV
+        # --------------------------------------------------------
+
+        frame = cv2.imdecode(
+            np_array,
+            cv2.IMREAD_COLOR,
+        )
+
+        return frame
+
+    except (
+        ValueError,
+        TypeError,
+        binascii.Error,
+        cv2.error,
+    ):
+        return None
+
+
+def calculate_object_motion(
+    track_id: Optional[int],
+    distance: float,
+    current_time: float,
+):
+    """
+    Calculate speed, approaching state and TTC.
+
+    Positive speed means the object is getting closer.
+    """
+
+    speed = 0.0
+    approaching = False
+    ttc = None
+
+    if track_id is None:
+        return speed, approaching, ttc
+
+    previous = track_history.get(track_id)
+
+    if previous is not None:
+
+        previous_distance = safe_float(
+            previous.get("distance"),
+            distance,
+        )
+
+        previous_time = safe_float(
+            previous.get("time"),
+            current_time,
+        )
+
+        delta_time = current_time - previous_time
+
+        if delta_time > 0:
+
+            # Positive value means the object is approaching.
+            distance_change = (
+                previous_distance - distance
+            )
+
+            speed = (
+                distance_change / delta_time
+            )
+
+            # Ignore tiny movements/noise.
+            if speed > 0.15:
+                approaching = True
+
+            # TTC only makes sense for an approaching object.
+            if approaching and speed > 0.1:
+
+                ttc = distance / speed
+
+                # Protect against invalid values.
+                if ttc < 0:
+                    ttc = None
+
+                # Ignore unrealistic values.
+                elif ttc > 999:
+                    ttc = None
+
+    # ------------------------------------------------------------
+    # Save current state
+    # ------------------------------------------------------------
+
+    track_history[track_id] = {
+        "distance": distance,
+        "time": current_time,
+    }
+
+    return speed, approaching, ttc
+
+
+def cleanup_track_history(
+    current_track_ids: set,
+    current_time: float,
+    max_age: float = 5.0,
+):
+    """
+    Remove old tracking information.
+
+    This prevents track_history from growing forever.
+    """
+
+    expired_ids = []
+
+    for track_id, state in track_history.items():
+
+        last_time = safe_float(
+            state.get("time"),
+            current_time,
+        )
+
+        # Remove tracks that have not appeared recently.
+        if (
+            track_id not in current_track_ids
+            and current_time - last_time > max_age
+        ):
+            expired_ids.append(track_id)
+
+    for track_id in expired_ids:
+        track_history.pop(track_id, None)
+
+
+def choose_next_inference_size(
+    danger_count: int,
+    warning_count: int,
+    object_count: int,
+) -> int:
+    """
+    Adaptive inference resolution.
+
+    High resolution is used when:
+    - danger exists
+    - warning exists
+    - many objects are present
+
+    Otherwise normal resolution is used.
+    """
+
+    if danger_count > 0:
+        return HIGH_IMAGE_SIZE
+
+    if warning_count > 0:
+        return HIGH_IMAGE_SIZE
+
+    if object_count >= 6:
+        return HIGH_IMAGE_SIZE
+
+    return NORMAL_IMAGE_SIZE
+
+
+def get_lidar_state() -> Dict[str, Any]:
+    """
+    Return the latest LiDAR information.
+
+    Keeps the API stable even if the LiDAR pipeline is not
+    connected or has no data yet.
+    """
+
+    default_state = {
         "connected": False,
         "points": [],
         "point_count": 0,
@@ -149,45 +415,64 @@ def get_latest_lidar() -> Dict[str, Any]:
     }
 
     if lidar_pipeline is None:
-        return default_lidar
+        return default_state
 
     try:
-        latest = getattr(lidar_pipeline, "latest", None)
+
+        latest = lidar_pipeline.latest
 
         if latest is None:
-            return default_lidar
+            return default_state
 
-        return latest
+        if isinstance(latest, dict):
 
-    except Exception as error:
-        print("LiDAR latest-state error:", repr(error))
-        return default_lidar
+            state = default_state.copy()
+            state.update(latest)
+
+            return state
+
+        return default_state
+
+    except Exception:
+        return default_state
 
 
 # ============================================================
-# ROOT
+# ROOT ENDPOINT
 # ============================================================
+
 
 @app.get("/")
 def root():
 
+    uptime = time.time() - SERVER_START_TIME
+
     return {
         "status": "running",
-        "message": "Adaptive 2.5D LiDAR Mapping Backend is working!",
-        "model": "YOLO",
+        "message": (
+            "Adaptive 2.5D LiDAR Mapping Backend "
+            "is working!"
+        ),
+        "model": "YOLO11n",
         "tracking": "ByteTrack",
         "device": str(DEVICE),
         "endpoint": "/ws/detection",
         "lidar_endpoint": "/ws/lidar",
-        "confidence": CONFIDENCE_THRESHOLD,
-        "normal_resolution": NORMAL_IMAGE_SIZE,
-        "high_resolution": HIGH_IMAGE_SIZE,
+        "active_detection_connections": (
+            active_detection_connections
+        ),
+        "active_lidar_connections": (
+            active_lidar_connections
+        ),
+        "inference_size": current_inference_size,
+        "uptime_seconds": round(uptime, 1),
     }
 
 
 # ============================================================
 # HEALTH CHECK
 # ============================================================
+
 
 @app.get("/health")
 def health():
@@ -196,10 +481,10 @@ def health():
         "status": "healthy",
         "model_loaded": model is not None,
         "device": str(DEVICE),
-        "cuda_available": torch.cuda.is_available(),
-        "tracking": "ByteTrack",
-        "adaptive_resolution": True,
         "lidar_available": lidar_pipeline is not None,
+        "active_detection_connections": (
+            active_detection_connections
+        ),
     }
 
 
@@ -207,167 +492,199 @@ def health():
 # LIDAR WEBSOCKET
 # ============================================================
 
+
 @app.websocket("/ws/lidar")
-async def lidar_websocket(websocket: WebSocket):
+async def lidar_websocket(
+    websocket: WebSocket,
+):
+
+    global active_lidar_connections
 
     await websocket.accept()
 
+    active_lidar_connections += 1
+
+    client_host = (
+        websocket.client.host
+        if websocket.client
+        else "unknown"
+    )
+
+    print()
     print("=" * 70)
-    print("LiDAR client connected")
+    print("LiDAR WebSocket connected")
+    print("Client:", client_host)
+    print(
+        "Active LiDAR connections:",
+        active_lidar_connections,
+    )
     print("=" * 70)
 
     try:
 
         while True:
 
+            # ----------------------------------------------------
+            # Receive JSON
+            # ----------------------------------------------------
+
             payload = await websocket.receive_json()
 
             if not isinstance(payload, dict):
-                await websocket.send_json(
-                    {
-                        "error": "Expected a JSON object"
-                    }
-                )
+
+                await websocket.send_json({
+                    "error": (
+                        "Expected a JSON object"
+                    )
+                })
+
                 continue
+
+            # ----------------------------------------------------
+            # Check points
+            # ----------------------------------------------------
 
             if "points" not in payload:
 
-                await websocket.send_json(
-                    {
-                        "error": "Expected a JSON object with a points array"
-                    }
-                )
+                await websocket.send_json({
+                    "error": (
+                        "Expected a 'points' array"
+                    )
+                })
 
                 continue
 
             if lidar_pipeline is None:
 
-                await websocket.send_json(
-                    {
-                        "error": "LiDAR pipeline is unavailable"
-                    }
-                )
+                await websocket.send_json({
+                    "error": (
+                        "LiDAR pipeline unavailable"
+                    ),
+                    "connected": False,
+                })
 
                 continue
+
+            # ----------------------------------------------------
+            # Process LiDAR
+            # ----------------------------------------------------
 
             try:
 
-                result = lidar_pipeline.process_frame(
-                    payload["points"],
-                    payload.get("labels"),
+                result = (
+                    lidar_pipeline.process_frame(
+                        payload["points"],
+                        payload.get("labels"),
+                    )
                 )
 
-            except (TypeError, ValueError) as error:
+            except (
+                TypeError,
+                ValueError,
+            ) as error:
 
-                print(
-                    "LiDAR processing validation error:",
-                    repr(error)
-                )
-
-                await websocket.send_json(
-                    {
-                        "error": str(error)
-                    }
-                )
+                await websocket.send_json({
+                    "error": str(error),
+                })
 
                 continue
 
-            except Exception as error:
-
-                print(
-                    "LiDAR processing error:",
-                    repr(error)
-                )
-
-                await websocket.send_json(
-                    {
-                        "error": "LiDAR processing failed"
-                    }
-                )
-
-                continue
+            # ----------------------------------------------------
+            # Send result
+            # ----------------------------------------------------
 
             await websocket.send_json(result)
 
     except WebSocketDisconnect:
 
-        if lidar_pipeline is not None:
-
-            try:
-                lidar_pipeline.disconnect()
-            except Exception:
-                pass
-
         print("LiDAR client disconnected")
 
     except Exception as error:
 
+        print()
+        print("=" * 70)
+        print("LiDAR WebSocket error")
+        print("Client:", client_host)
+        print("ERROR:", repr(error))
+        print("=" * 70)
+
+    finally:
+
+        active_lidar_connections = max(
+            0,
+            active_lidar_connections - 1,
+        )
+
         if lidar_pipeline is not None:
 
             try:
                 lidar_pipeline.disconnect()
+
             except Exception:
                 pass
 
-        print("LiDAR websocket error:", repr(error))
+        print(
+            "Active LiDAR connections:",
+            active_lidar_connections,
+        )
 
 
 # ============================================================
 # DETECTION WEBSOCKET
 # ============================================================
 
+
 @app.websocket("/ws/detection")
 async def detection_websocket(
-    websocket: WebSocket
+    websocket: WebSocket,
 ):
 
     global current_inference_size
+    global active_detection_connections
 
-    # --------------------------------------------------------
-    # ACCEPT CONNECTION
-    # --------------------------------------------------------
+    # ------------------------------------------------------------
+    # Accept WebSocket
+    # ------------------------------------------------------------
 
     await websocket.accept()
 
-    client_host = "unknown"
+    active_detection_connections += 1
 
-    try:
+    client_host = (
+        websocket.client.host
+        if websocket.client
+        else "unknown"
+    )
 
-        if websocket.client is not None:
-            client_host = websocket.client.host
-
-    except Exception:
-        pass
-
-    print("=" * 70)
-    print("Frontend connected")
-    print("Client:", client_host)
-    print("WebSocket endpoint: /ws/detection")
-    print("=" * 70)
-
-    previous_frame_time = time.time()
+    connection_start = time.time()
 
     frame_number = 0
 
-    try:
+    previous_frame_time = time.time()
 
-        # ====================================================
-        # MAIN LOOP
-        # ====================================================
+    print()
+    print("=" * 70)
+    print("FRONTEND DETECTION CLIENT CONNECTED")
+    print("Client:", client_host)
+    print(
+        "Active detection connections:",
+        active_detection_connections,
+    )
+    print("=" * 70)
+
+    try:
 
         while True:
 
-            frame_number += 1
-
-            frame_start_time = time.time()
-
             # ====================================================
-            # RECEIVE IMAGE
+            # RECEIVE FRAME
             # ====================================================
+
+            receive_start = time.time()
 
             try:
 
-                data = await websocket.receive_text()
+                message = await websocket.receive()
 
             except WebSocketDisconnect:
 
@@ -376,171 +693,165 @@ async def detection_websocket(
             except Exception as error:
 
                 print(
-                    "ERROR receiving frame:",
-                    repr(error)
+                    "Receive error:",
+                    repr(error),
                 )
 
-                continue
+                break
 
-            print(
-                f"[FRAME {frame_number}] FRAME RECEIVED | "
-                f"data_length={len(data)}"
-            )
+            # ----------------------------------------------------
+            # Determine message type
+            # ----------------------------------------------------
 
-            # ====================================================
-            # VALIDATE RECEIVED DATA
-            # ====================================================
+            data = None
 
-            if not data:
+            if "text" in message:
 
-                print(
-                    f"[FRAME {frame_number}] Empty frame received"
-                )
+                data = message["text"]
 
-                continue
+            elif "bytes" in message:
 
-            # ====================================================
-            # REMOVE DATA URL PREFIX
-            # ====================================================
+                # ------------------------------------------------
+                # We also support raw image bytes.
+                # ------------------------------------------------
 
-            if "," in data:
+                raw_bytes = message["bytes"]
 
-                data = data.split(",", 1)[1]
+                try:
 
-            # ====================================================
-            # BASE64 -> BYTES
-            # ====================================================
+                    np_array = np.frombuffer(
+                        raw_bytes,
+                        dtype=np.uint8,
+                    )
 
-            try:
+                    frame = cv2.imdecode(
+                        np_array,
+                        cv2.IMREAD_COLOR,
+                    )
 
-                image_bytes = base64.b64decode(
-                    data,
-                    validate=True
-                )
+                except Exception:
 
-            except Exception as error:
+                    frame = None
 
-                print(
-                    f"[FRAME {frame_number}] "
-                    f"Invalid base64 image: {repr(error)}"
-                )
+            else:
 
-                continue
-
-            if not image_bytes:
-
-                print(
-                    f"[FRAME {frame_number}] "
-                    "Decoded image is empty"
-                )
-
-                continue
-
-            print(
-                f"[FRAME {frame_number}] "
-                f"Base64 decoded | bytes={len(image_bytes)}"
-            )
+                frame = None
 
             # ====================================================
-            # BYTES -> NUMPY
+            # TEXT / BASE64 IMAGE
             # ====================================================
 
-            try:
+            if data is not None:
 
-                np_array = np.frombuffer(
-                    image_bytes,
-                    np.uint8
-                )
-
-            except Exception as error:
-
-                print(
-                    f"[FRAME {frame_number}] "
-                    f"NumPy conversion failed: {repr(error)}"
-                )
-
-                continue
+                frame = decode_base64_image(data)
 
             # ====================================================
-            # NUMPY -> OPENCV IMAGE
+            # VALIDATE FRAME
             # ====================================================
-
-            try:
-
-                frame = cv2.imdecode(
-                    np_array,
-                    cv2.IMREAD_COLOR
-                )
-
-            except Exception as error:
-
-                print(
-                    f"[FRAME {frame_number}] "
-                    f"OpenCV decode error: {repr(error)}"
-                )
-
-                continue
 
             if frame is None:
 
                 print(
-                    f"[FRAME {frame_number}] "
-                    "OpenCV returned None"
+                    f"[FRAME {frame_number + 1}] "
+                    "Invalid image received"
                 )
 
+                try:
+
+                    await websocket.send_json({
+                        "error": "Invalid image frame",
+                        "objects": [],
+                        "counts": {
+                            "danger": 0,
+                            "warning": 0,
+                            "safe": 0,
+                            "total": 0,
+                        },
+                        "fps": 0,
+                        "inference_size": (
+                            current_inference_size
+                        ),
+                        "map": [],
+                        "lidar": get_lidar_state(),
+                    })
+
+                except Exception:
+                    pass
+
                 continue
+
+            # ====================================================
+            # FRAME NUMBER
+            # ====================================================
+
+            frame_number += 1
+
+            receive_time = time.time()
+
+            # ====================================================
+            # IMAGE INFORMATION
+            # ====================================================
 
             height, width = frame.shape[:2]
 
             print(
                 f"[FRAME {frame_number}] "
-                f"IMAGE DECODED | {width}x{height}"
+                f"received {width}x{height} "
+                f"in "
+                f"{(receive_time - receive_start) * 1000:.1f} ms"
+            )
+
+            # ====================================================
+            # SAVE THE RESOLUTION ACTUALLY USED
+            # ====================================================
+
+            inference_size_used = (
+                current_inference_size
             )
 
             # ====================================================
             # YOLO + BYTE TRACK
             # ====================================================
+            #
+            # The lock prevents multiple WebSocket clients from
+            # running the same YOLO model simultaneously.
+            #
+            # This is particularly important on Render CPU.
+            #
+            # ====================================================
 
-            print(
-                f"[FRAME {frame_number}] "
-                f"RUNNING YOLO | imgsz={current_inference_size}"
-            )
+            inference_start = time.time()
 
-            yolo_start_time = time.time()
+            async with inference_lock:
 
-            try:
-
-                results = model.track(
-
-                    frame,
-
-                    persist=True,
-
-                    tracker="bytetrack.yaml",
-
-                    conf=CONFIDENCE_THRESHOLD,
-
-                    imgsz=current_inference_size,
-
-                    device=DEVICE,
-
-                    verbose=False,
-
-                )
-
-            except Exception as error:
-
-                print(
-                    f"[FRAME {frame_number}] "
-                    "YOLO ERROR:",
-                    repr(error)
-                )
-
-                # Keep WebSocket alive instead of killing it.
                 try:
 
-                    await websocket.send_json(
-                        {
+                    results = model.track(
+                        frame,
+                        persist=True,
+                        tracker="bytetrack.yaml",
+                        conf=CONFIDENCE_THRESHOLD,
+                        imgsz=inference_size_used,
+                        device=DEVICE,
+                        verbose=False,
+                    )
+
+                except Exception as error:
+
+                    print()
+                    print("=" * 70)
+                    print(
+                        f"YOLO ERROR - FRAME {frame_number}"
+                    )
+                    print("ERROR:", repr(error))
+                    print("=" * 70)
+
+                    try:
+
+                        await websocket.send_json({
+                            "error": (
+                                "YOLO inference failed"
+                            ),
                             "objects": [],
                             "counts": {
                                 "danger": 0,
@@ -549,54 +860,35 @@ async def detection_websocket(
                                 "total": 0,
                             },
                             "fps": 0,
-                            "inference_size": current_inference_size,
-                            "image": {
-                                "width": width,
-                                "height": height,
-                            },
+                            "inference_size": (
+                                inference_size_used
+                            ),
                             "map": [],
-                            "camera": {
-                                "width": width,
-                                "height": height,
-                                "connected": True,
-                            },
-                            "lidar": get_latest_lidar(),
-                            "system": {
-                                "device": str(DEVICE),
-                                "model": "YOLO",
-                                "tracker": "ByteTrack",
-                                "adaptive_resolution": True,
-                                "error": "YOLO inference failed",
-                            },
-                        }
-                    )
+                            "lidar": (
+                                get_lidar_state()
+                            ),
+                        })
 
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
-                continue
+                    continue
 
-            yolo_time = time.time() - yolo_start_time
-
-            print(
-                f"[FRAME {frame_number}] "
-                f"YOLO FINISHED | "
-                f"time={yolo_time:.3f}s"
-            )
+            inference_time = time.time() - inference_start
 
             # ====================================================
-            # DETECTION RESULT CONTAINER
+            # DETECTION PROCESSING
             # ====================================================
 
-            objects: List[Dict[str, Any]] = []
+            objects = []
 
             current_track_ids = set()
 
             current_time = time.time()
 
-            # ====================================================
-            # PROCESS YOLO RESULTS
-            # ====================================================
+            # ----------------------------------------------------
+            # Check YOLO result
+            # ----------------------------------------------------
 
             if (
                 results
@@ -606,15 +898,8 @@ async def detection_websocket(
 
                 boxes = results[0].boxes
 
-                detection_count = len(boxes)
-
-                print(
-                    f"[FRAME {frame_number}] "
-                    f"YOLO DETECTIONS: {detection_count}"
-                )
-
                 # ------------------------------------------------
-                # PROCESS EACH OBJECT
+                # Iterate detections
                 # ------------------------------------------------
 
                 for i in range(len(boxes)):
@@ -623,59 +908,105 @@ async def detection_websocket(
 
                         box = boxes[i]
 
-                        # ========================================
+                        # =================================================
                         # BOUNDING BOX
-                        # ========================================
+                        # =================================================
 
-                        x1, y1, x2, y2 = (
+                        coordinates = (
                             box.xyxy[0]
                             .detach()
                             .cpu()
                             .numpy()
                         )
 
-                        x1 = int(x1)
-                        y1 = int(y1)
-                        x2 = int(x2)
-                        y2 = int(y2)
+                        x1, y1, x2, y2 = coordinates
 
-                        # ========================================
+                        x1 = max(
+                            0,
+                            min(
+                                int(x1),
+                                width - 1,
+                            ),
+                        )
+
+                        y1 = max(
+                            0,
+                            min(
+                                int(y1),
+                                height - 1,
+                            ),
+                        )
+
+                        x2 = max(
+                            0,
+                            min(
+                                int(x2),
+                                width - 1,
+                            ),
+                        )
+
+                        y2 = max(
+                            0,
+                            min(
+                                int(y2),
+                                height - 1,
+                            ),
+                        )
+
+                        # Ignore invalid boxes.
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+
+                        # =================================================
                         # CONFIDENCE
-                        # ========================================
+                        # =================================================
 
-                        confidence = float(
+                        confidence = safe_float(
                             box.conf[0]
                             .detach()
                             .cpu()
                             .item()
                         )
 
-                        # ========================================
-                        # CLASS
-                        # ========================================
+                        # =================================================
+                        # CLASS ID
+                        # =================================================
 
-                        class_id = int(
+                        class_id = safe_int(
                             box.cls[0]
                             .detach()
                             .cpu()
                             .item()
                         )
 
-                        class_name = get_class_name(
-                            class_id
-                        )
+                        # =================================================
+                        # CLASS NAME
+                        # =================================================
 
-                        # ========================================
+                        if (
+                            0 <= class_id
+                            < len(CLASS_NAMES)
+                        ):
+
+                            class_name = (
+                                CLASS_NAMES[class_id]
+                            )
+
+                        else:
+
+                            class_name = "Unknown"
+
+                        # =================================================
                         # TRACK ID
-                        # ========================================
+                        # =================================================
 
-                        track_id: Optional[int] = None
+                        track_id = None
 
                         if boxes.id is not None:
 
                             try:
 
-                                track_id = int(
+                                track_id = safe_int(
                                     boxes.id[i]
                                     .detach()
                                     .cpu()
@@ -690,187 +1021,119 @@ async def detection_websocket(
 
                                 track_id = None
 
-                        # ========================================
+                        # =================================================
                         # OBJECT WIDTH
-                        # ========================================
+                        # =================================================
 
                         pixel_width = max(
                             1,
-                            x2 - x1
+                            x2 - x1,
                         )
 
-                        # ========================================
+                        # =================================================
                         # DISTANCE
-                        # ========================================
+                        # =================================================
 
                         try:
 
-                            distance = float(
+                            distance = safe_float(
                                 estimate_distance(
                                     class_name,
-                                    pixel_width
-                                )
+                                    pixel_width,
+                                ),
+                                0.0,
                             )
 
                         except Exception as error:
 
                             print(
-                                f"[FRAME {frame_number}] "
-                                f"Distance estimation error "
-                                f"for {class_name}:",
-                                repr(error)
+                                "Distance estimation error:",
+                                repr(error),
                             )
 
                             distance = 0.0
 
-                        # ========================================
-                        # SPEED
-                        # ========================================
+                        # =================================================
+                        # SPEED / APPROACHING / TTC
+                        # =================================================
 
-                        speed = 0.0
+                        (
+                            speed,
+                            approaching,
+                            ttc,
+                        ) = calculate_object_motion(
+                            track_id,
+                            distance,
+                            current_time,
+                        )
 
-                        approaching = False
-
-                        ttc = None
-
-                        # ========================================
-                        # TRACK HISTORY
-                        # ========================================
-
-                        if track_id is not None:
-
-                            previous = track_history.get(
-                                track_id
-                            )
-
-                            if previous is not None:
-
-                                previous_distance = float(
-                                    previous["distance"]
-                                )
-
-                                previous_time = float(
-                                    previous["time"]
-                                )
-
-                                delta_time = (
-                                    current_time
-                                    - previous_time
-                                )
-
-                                if delta_time > 0:
-
-                                    # Positive means object
-                                    # is getting closer.
-
-                                    distance_change = (
-                                        previous_distance
-                                        - distance
-                                    )
-
-                                    speed = (
-                                        distance_change
-                                        / delta_time
-                                    )
-
-                                    # Ignore very small movement.
-
-                                    if speed > 0.15:
-
-                                        approaching = True
-
-                                    # =================================
-                                    # TIME TO COLLISION
-                                    # =================================
-
-                                    if (
-                                        approaching
-                                        and speed > 0.1
-                                        and distance > 0
-                                    ):
-
-                                        ttc = (
-                                            distance
-                                            / speed
-                                        )
-
-                            # Save current track state.
-
-                            track_history[track_id] = {
-
-                                "distance": distance,
-
-                                "time": current_time,
-
-                            }
-
-                        # ========================================
+                        # =================================================
                         # RISK
-                        # ========================================
+                        # =================================================
 
                         try:
 
                             risk = calculate_risk(
                                 distance,
-                                ttc
+                                ttc,
                             )
 
                         except Exception as error:
 
                             print(
-                                f"[FRAME {frame_number}] "
-                                f"Risk calculation error:",
-                                repr(error)
+                                "Risk calculation error:",
+                                repr(error),
                             )
 
                             risk = "SAFE"
 
-                        # ========================================
-                        # CENTER
-                        # ========================================
+                        # =================================================
+                        # OBJECT CENTER
+                        # =================================================
 
                         center_x = (
                             x1 + x2
-                        ) / 2
+                        ) / 2.0
 
                         center_y = (
                             y1 + y2
-                        ) / 2
+                        ) / 2.0
 
-                        # ========================================
+                        # =================================================
                         # RELATIVE POSITION
-                        # ========================================
+                        # =================================================
 
                         relative_x = (
                             center_x / width
                             if width > 0
-                            else 0
+                            else 0.5
                         )
 
                         relative_y = (
                             center_y / height
                             if height > 0
-                            else 0
+                            else 0.5
                         )
 
-                        # ========================================
+                        # =================================================
                         # 2.5D MAP X
-                        # ========================================
+                        # =================================================
+                        #
+                        # -1 = left
+                        #  0 = center
+                        # +1 = right
+                        #
+                        # =================================================
 
                         map_x = (
-                            (
-                                center_x / width
-                            ) * 2
-                            - 1
-                            if width > 0
-                            else 0
-                        )
+                            relative_x * 2.0
+                        ) - 1.0
 
-                        # ========================================
+                        # =================================================
                         # OBJECT DATA
-                        # ========================================
+                        # =================================================
 
-                        objects.append({
+                        object_data = {
 
                             "id": track_id,
 
@@ -880,158 +1143,124 @@ async def detection_websocket(
 
                             "confidence": round(
                                 confidence,
-                                3
+                                3,
                             ),
 
                             "x1": x1,
-
                             "y1": y1,
-
                             "x2": x2,
-
                             "y2": y2,
 
-                            "width": x2 - x1,
+                            "width": (
+                                x2 - x1
+                            ),
 
-                            "height": y2 - y1,
+                            "height": (
+                                y2 - y1
+                            ),
 
                             "center_x": round(
                                 center_x,
-                                1
+                                1,
                             ),
 
                             "center_y": round(
                                 center_y,
-                                1
+                                1,
                             ),
 
                             "distance": round(
                                 distance,
-                                2
+                                2,
                             ),
 
                             "speed": round(
                                 speed,
-                                2
+                                2,
                             ),
 
                             "ttc": (
-                                round(ttc, 2)
+                                round(
+                                    ttc,
+                                    2,
+                                )
                                 if ttc is not None
                                 else None
                             ),
 
-                            "approaching": approaching,
+                            "approaching": (
+                                approaching
+                            ),
 
                             "risk": risk,
 
                             "rel_x": round(
                                 relative_x,
-                                3
+                                3,
                             ),
 
                             "rel_y": round(
                                 relative_y,
-                                3
+                                3,
                             ),
 
                             "map_x": round(
                                 map_x,
-                                3
+                                3,
                             ),
 
                             "map_distance": round(
                                 distance,
-                                2
+                                2,
                             ),
+                        }
 
-                        })
+                        objects.append(
+                            object_data
+                        )
 
                     except Exception as error:
 
                         print(
-                            f"[FRAME {frame_number}] "
                             f"Object processing error "
                             f"at index {i}:",
-                            repr(error)
+                            repr(error),
                         )
 
                         continue
 
-            else:
-
-                print(
-                    f"[FRAME {frame_number}] "
-                    "YOLO DETECTIONS: 0"
-                )
-
             # ====================================================
-            # LIMIT TRACK HISTORY
+            # CLEAN OLD TRACKS
             # ====================================================
 
-            if len(track_history) > MAX_TRACK_HISTORY:
-
-                active_ids = set(
-                    current_track_ids
-                )
-
-                old_ids = list(
-                    track_history.keys()
-                )
-
-                for track_id in old_ids:
-
-                    if track_id not in active_ids:
-
-                        try:
-                            del track_history[track_id]
-                        except KeyError:
-                            pass
-
-                        if len(track_history) <= (
-                            MAX_TRACK_HISTORY * 0.8
-                        ):
-                            break
+            cleanup_track_history(
+                current_track_ids,
+                current_time,
+            )
 
             # ====================================================
             # COUNTS
             # ====================================================
 
             danger_count = sum(
-
                 1
-
                 for obj in objects
-
-                if str(
-                    obj["risk"]
-                ).upper() == "DANGER"
-
+                if obj.get("risk") == "DANGER"
             )
 
             warning_count = sum(
-
                 1
-
                 for obj in objects
-
-                if str(
-                    obj["risk"]
-                ).upper() == "WARNING"
-
+                if obj.get("risk") == "WARNING"
             )
 
             safe_count = sum(
-
                 1
-
                 for obj in objects
-
-                if str(
-                    obj["risk"]
-                ).upper() == "SAFE"
-
+                if obj.get("risk") == "SAFE"
             )
+
+            total_objects = len(objects)
 
             # ====================================================
             # FPS
@@ -1040,18 +1269,13 @@ async def detection_websocket(
             now = time.time()
 
             elapsed = (
-                now
-                - previous_frame_time
+                now - previous_frame_time
             )
 
             fps = (
-
-                1 / elapsed
-
+                1.0 / elapsed
                 if elapsed > 0
-
-                else 0
-
+                else 0.0
             )
 
             previous_frame_time = now
@@ -1060,29 +1284,17 @@ async def detection_websocket(
             # ADAPTIVE RESOLUTION
             # ====================================================
 
-            if danger_count > 0:
-
-                current_inference_size = (
-                    HIGH_IMAGE_SIZE
+            next_inference_size = (
+                choose_next_inference_size(
+                    danger_count,
+                    warning_count,
+                    total_objects,
                 )
+            )
 
-            elif warning_count > 0:
-
-                current_inference_size = (
-                    HIGH_IMAGE_SIZE
-                )
-
-            elif len(objects) >= 6:
-
-                current_inference_size = (
-                    HIGH_IMAGE_SIZE
-                )
-
-            else:
-
-                current_inference_size = (
-                    NORMAL_IMAGE_SIZE
-                )
+            current_inference_size = (
+                next_inference_size
+            )
 
             # ====================================================
             # ENVIRONMENT MAP
@@ -1094,37 +1306,46 @@ async def detection_websocket(
 
                 map_objects.append({
 
-                    "id": obj["id"],
+                    "id": obj.get("id"),
 
-                    "class": obj["class"],
+                    "class": obj.get(
+                        "class",
+                        "Unknown",
+                    ),
 
-                    "x": obj["map_x"],
+                    "x": obj.get(
+                        "map_x",
+                        0,
+                    ),
 
-                    "distance": obj[
-                        "map_distance"
-                    ],
+                    "distance": obj.get(
+                        "map_distance",
+                        0,
+                    ),
 
-                    "risk": obj["risk"],
+                    "risk": obj.get(
+                        "risk",
+                        "SAFE",
+                    ),
 
-                    "approaching": obj[
-                        "approaching"
-                    ],
-
+                    "approaching": obj.get(
+                        "approaching",
+                        False,
+                    ),
                 })
 
             # ====================================================
-            # LIDAR
+            # LIDAR STATE
             # ====================================================
 
-            lidar_data = get_latest_lidar()
+            lidar_state = get_lidar_state()
 
             # ====================================================
-            # TOTAL PROCESSING TIME
+            # TOTAL FRAME PROCESSING TIME
             # ====================================================
 
             total_processing_time = (
-                time.time()
-                - frame_start_time
+                time.time() - receive_time
             )
 
             # ====================================================
@@ -1133,7 +1354,15 @@ async def detection_websocket(
 
             response = {
 
+                # ------------------------------------------------
+                # Objects
+                # ------------------------------------------------
+
                 "objects": objects,
+
+                # ------------------------------------------------
+                # Counts
+                # ------------------------------------------------
 
                 "counts": {
 
@@ -1143,28 +1372,36 @@ async def detection_websocket(
 
                     "safe": safe_count,
 
-                    "total": len(objects),
-
+                    "total": total_objects,
                 },
+
+                # ------------------------------------------------
+                # Performance
+                # ------------------------------------------------
 
                 "fps": round(
                     fps,
-                    1
+                    1,
                 ),
 
                 "inference_size": (
-                    current_inference_size
+                    inference_size_used
                 ),
+
+                # ------------------------------------------------
+                # Image
+                # ------------------------------------------------
 
                 "image": {
 
                     "width": width,
 
                     "height": height,
-
                 },
 
-                "map": map_objects,
+                # ------------------------------------------------
+                # Camera
+                # ------------------------------------------------
 
                 "camera": {
 
@@ -1173,67 +1410,70 @@ async def detection_websocket(
                     "height": height,
 
                     "connected": True,
-
                 },
 
-                "lidar": lidar_data,
+                # ------------------------------------------------
+                # 2.5D map
+                # ------------------------------------------------
+
+                "map": map_objects,
+
+                # ------------------------------------------------
+                # LiDAR
+                # ------------------------------------------------
+
+                "lidar": lidar_state,
+
+                # ------------------------------------------------
+                # Performance diagnostics
+                # ------------------------------------------------
+
+                "performance": {
+
+                    "inference_ms": round(
+                        inference_time * 1000,
+                        1,
+                    ),
+
+                    "processing_ms": round(
+                        total_processing_time
+                        * 1000,
+                        1,
+                    ),
+
+                    "frame": frame_number,
+                },
+
+                # ------------------------------------------------
+                # System
+                # ------------------------------------------------
 
                 "system": {
 
-                    "device": str(DEVICE),
+                    "device": str(
+                        DEVICE
+                    ),
 
-                    "model": "YOLO",
+                    "model": "YOLO11n",
 
                     "tracker": "ByteTrack",
 
                     "adaptive_resolution": True,
 
-                    "frame": frame_number,
+                    "backend": "FastAPI",
 
-                    "yolo_time": round(
-                        yolo_time,
-                        3
-                    ),
-
-                    "processing_time": round(
-                        total_processing_time,
-                        3
-                    ),
-
+                    "websocket": True,
                 },
-
             }
 
             # ====================================================
-            # DEBUG SUMMARY
-            # ====================================================
-
-            print(
-                f"[FRAME {frame_number}] "
-                f"RESULT | "
-                f"objects={len(objects)} | "
-                f"danger={danger_count} | "
-                f"warning={warning_count} | "
-                f"safe={safe_count} | "
-                f"fps={fps:.1f} | "
-                f"next_imgsz={current_inference_size} | "
-                f"total_time={total_processing_time:.3f}s"
-            )
-
-            # ====================================================
-            # SEND RESPONSE
+            # SEND RESULT
             # ====================================================
 
             try:
 
                 await websocket.send_json(
                     response
-                )
-
-                print(
-                    f"[FRAME {frame_number}] "
-                    "SENDING RESPONSE: "
-                    f"{len(objects)} objects"
                 )
 
             except WebSocketDisconnect:
@@ -1243,34 +1483,152 @@ async def detection_websocket(
             except Exception as error:
 
                 print(
-                    f"[FRAME {frame_number}] "
-                    f"Response send error:",
-                    repr(error)
+                    "Failed to send response:",
+                    repr(error),
                 )
 
                 break
 
+            # ====================================================
+            # SERVER LOG
+            # ====================================================
+
+            if (
+                frame_number <= 5
+                or frame_number % 10 == 0
+            ):
+
+                print(
+                    f"[FRAME {frame_number}] "
+                    f"objects={total_objects} | "
+                    f"D={danger_count} | "
+                    f"W={warning_count} | "
+                    f"S={safe_count} | "
+                    f"FPS={fps:.1f} | "
+                    f"YOLO={inference_time * 1000:.0f}ms | "
+                    f"size={inference_size_used}"
+                )
+
     # ============================================================
-    # FRONTEND DISCONNECT
+    # CLIENT DISCONNECT
     # ============================================================
 
     except WebSocketDisconnect:
 
+        connection_duration = (
+            time.time()
+            - connection_start
+        )
+
+        print()
         print("=" * 70)
-        print("Frontend disconnected")
+        print("FRONTEND DISCONNECTED")
         print("Client:", client_host)
-        print("Frames processed:", frame_number)
+        print(
+            "Frames processed:",
+            frame_number,
+        )
+        print(
+            "Connection duration:",
+            round(connection_duration, 1),
+            "seconds",
+        )
         print("=" * 70)
 
     # ============================================================
-    # UNEXPECTED WEBSOCKET ERROR
+    # GENERAL ERROR
     # ============================================================
 
     except Exception as error:
 
+        print()
         print("=" * 70)
-        print("WebSocket error")
+        print("WEBSOCKET ERROR")
         print("Client:", client_host)
-        print("Frames processed:", frame_number)
-        print("ERROR:", repr(error))
+        print(
+            "Frames processed:",
+            frame_number,
+        )
+        print(
+            "ERROR:",
+            repr(error),
+        )
         print("=" * 70)
+
+    # ============================================================
+    # FINAL CLEANUP
+    # ============================================================
+
+    finally:
+
+        active_detection_connections = max(
+            0,
+            active_detection_connections - 1,
+        )
+
+        print(
+            "Active detection connections:",
+            active_detection_connections,
+        )
+
+
+# ============================================================
+# STARTUP / SHUTDOWN EVENTS
+# ============================================================
+
+
+@app.on_event("startup")
+async def startup_event():
+
+    print()
+    print("=" * 70)
+    print("APPLICATION STARTUP COMPLETE")
+    print("=" * 70)
+
+    print(
+        "Detection endpoint:",
+        "/ws/detection",
+    )
+
+    print(
+        "LiDAR endpoint:",
+        "/ws/lidar",
+    )
+
+    print(
+        "Device:",
+        DEVICE,
+    )
+
+    print(
+        "Normal inference size:",
+        NORMAL_IMAGE_SIZE,
+    )
+
+    print(
+        "High inference size:",
+        HIGH_IMAGE_SIZE,
+    )
+
+    print("=" * 70)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+
+    print()
+    print("=" * 70)
+    print("ADAPTIVE 2.5D LIDAR MAPPING BACKEND SHUTDOWN")
+    print("=" * 70)
+
+    print(
+        "Active detection connections:",
+        active_detection_connections,
+    )
+
+    print(
+        "Active LiDAR connections:",
+        active_lidar_connections,
+    )
+
+    print("=" * 70)
