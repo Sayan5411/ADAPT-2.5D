@@ -1,0 +1,33 @@
+<annotation>
+  <folder>20230810</folder>
+  <filename>20230810_17_51_03_343_000_5FV2suD9z9e1G1pGRwA5hBogQPH3_F_4160_3120.jpg</filename>
+  <source>
+    <database>Unknown</database>
+    <annotation>Unknown</annotation>
+    <image>Unknown</image>
+  </source>
+  <size>
+    <width>3120</width>
+    <height>4160</height>
+    <depth></depth>
+  </size>
+  <segmented>0</segmented>
+  <object>
+    <name>truck_tanker</name>
+    <truncated>0</truncated>
+    <occluded>0</occluded>
+    <difficult>0</difficult>
+    <bndbox>
+      <xmin>649.94</xmin>
+      <ymin>1381.47</ymin>
+      <xmax>2182.88</xmax>
+      <ymax>1875.17</ymax>
+    </bndbox>
+    <attributes>
+      <attribute>
+        <name>rotation</name>
+        <value>0.0</value>
+      </attribute>
+    </attributes>
+  </object>
+</annotation>

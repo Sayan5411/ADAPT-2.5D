@@ -1,0 +1,26 @@
+<annotation>
+	<folder>concrete_mixer_images</folder>
+	<filename>20230629_11_45_47_309_000_cxQ4BpIvcQOYnMur8gVEisGE6dr2_F_4160_3120.jpg</filename>
+	<path>D:\data_cluster\kaggle_datasets\2024\concrete_mixer\concrete_mixer_images\20230629_11_45_47_309_000_cxQ4BpIvcQOYnMur8gVEisGE6dr2_F_4160_3120.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>3120</width>
+		<height>4160</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>concrete_mixer</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>425</xmin>
+			<ymin>577</ymin>
+			<xmax>2812</xmax>
+			<ymax>2051</ymax>
+		</bndbox>
+	</object>
+</annotation>
