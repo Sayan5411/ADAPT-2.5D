@@ -1,169 +1,352 @@
-```javascript
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+
 import CameraView from "../components/CameraView";
 import Dashboard from "../components/Dashboard";
 import ObjectList from "../components/ObjectList";
 import SpatialMap from "../components/SpatialMap";
 
+const EMPTY_DATA = {
+  objects: [],
+  counts: {
+    danger: 0,
+    warning: 0,
+    safe: 0,
+    total: 0,
+  },
+  fps: 0,
+  inference_size: 640,
+  map: [],
+  lidar: {
+    connected: false,
+    points: [],
+    point_count: 0,
+    grid: [],
+    elevation: [],
+    traversability: [],
+  },
+  image: {
+    width: 640,
+    height: 360,
+  },
+};
+
 export default function Home() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const socketRef = useRef(null);
-  const streamRef = useRef(null);
 
-  // Prevent multiple WebSockets
+  // Prevent multiple WebSocket connections.
   const connectingRef = useRef(false);
 
-  // Prevent multiple frames from being processed at once
-  const processingRef = useRef(false);
+  // Prevent sending a new frame while Render is still processing
+  // the previous frame.
+  const processingFrameRef = useRef(false);
+
+  const intervalRef = useRef(null);
 
   const [cameraStarted, setCameraStarted] = useState(false);
   const [connected, setConnected] = useState(false);
+  const [data, setData] = useState(EMPTY_DATA);
 
-  const [data, setData] = useState({
-    objects: [],
-    counts: {
-      danger: 0,
-      warning: 0,
-      safe: 0,
-      total: 0,
-    },
-    fps: 0,
-    inference_size: 640,
-    map: [],
-    lidar: {
-      connected: false,
-      points: [],
-      point_count: 0,
-      grid: [],
-      elevation: [],
-      traversability: [],
-    },
-  });
-
-  // ============================================================
+  // ------------------------------------------------------------
   // WEBSOCKET URL
-  // ============================================================
+  // ------------------------------------------------------------
 
-  const getWebSocketURL = () => {
-    const envURL = process.env.NEXT_PUBLIC_WS_URL;
+  const getWebSocketUrl = useCallback(() => {
+    const configuredUrl = process.env.NEXT_PUBLIC_WS_URL?.trim();
 
-    if (envURL) {
-      return envURL;
+    if (configuredUrl) {
+      return configuredUrl;
     }
 
-    // Local development fallback
+    // Local development fallback.
     return "ws://127.0.0.1:8000/ws/detection";
-  };
+  }, []);
 
-  // ============================================================
+  // ------------------------------------------------------------
+  // CLOSE WEBSOCKET
+  // ------------------------------------------------------------
+
+  const closeWebSocket = useCallback(() => {
+    const socket = socketRef.current;
+
+    if (socket) {
+      try {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        socket.close();
+      } catch (error) {
+        console.warn("WebSocket close error:", error);
+      }
+    }
+
+    socketRef.current = null;
+    connectingRef.current = false;
+    processingFrameRef.current = false;
+
+    setConnected(false);
+  }, []);
+
+  // ------------------------------------------------------------
   // CONNECT WEBSOCKET
-  // ============================================================
+  // ------------------------------------------------------------
 
-  function connectWebSocket() {
-    // Already connected / connecting
-    if (
-      socketRef.current &&
-      (
-        socketRef.current.readyState === WebSocket.OPEN ||
-        socketRef.current.readyState === WebSocket.CONNECTING
-      )
-    ) {
-      console.log("WebSocket already connected/connecting");
+  const connectWebSocket = useCallback(() => {
+    // Already connected.
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
       return;
     }
 
-    // Extra protection
+    // Connection is currently being created.
     if (connectingRef.current) {
       return;
     }
 
     connectingRef.current = true;
 
-    const wsURL = getWebSocketURL();
+    const wsUrl = getWebSocketUrl();
 
-    console.log("Connecting WebSocket:");
-    console.log(wsURL);
+    console.log("========================================");
+    console.log("Connecting to detection backend...");
+    console.log("WebSocket URL:", wsUrl);
+    console.log("========================================");
 
-    const socket = new WebSocket(wsURL);
+    let socket;
+
+    try {
+      socket = new WebSocket(wsUrl);
+    } catch (error) {
+      console.error("Failed to create WebSocket:", error);
+
+      connectingRef.current = false;
+      setConnected(false);
+
+      return;
+    }
 
     socketRef.current = socket;
 
+    // ----------------------------------------------------------
+    // OPEN
+    // ----------------------------------------------------------
+
     socket.onopen = () => {
-      console.log("=================================");
-      console.log("WebSocket connected");
-      console.log("=================================");
+      console.log("========================================");
+      console.log("WebSocket connected successfully");
+      console.log("Detection pipeline is ready");
+      console.log("========================================");
 
       connectingRef.current = false;
-      processingRef.current = false;
-
       setConnected(true);
     };
+
+    // ----------------------------------------------------------
+    // MESSAGE
+    // ----------------------------------------------------------
 
     socket.onmessage = (event) => {
       try {
         const result = JSON.parse(event.data);
 
-        console.log("Detection result:", result);
+        console.log("Detection response:", result);
 
-        // Keep lidar state because backend does not currently send it
-        setData((previous) => ({
-          ...previous,
+        // Backend error.
+        if (result.error) {
+          console.error("Backend error:", result.error);
 
+          processingFrameRef.current = false;
+          return;
+        }
+
+        // Update dashboard data.
+        setData({
+          ...EMPTY_DATA,
           ...result,
 
-          lidar: result.lidar ?? previous.lidar,
-        }));
+          objects: Array.isArray(result.objects)
+            ? result.objects
+            : [],
 
-        // Previous frame finished
-        processingRef.current = false;
+          counts: {
+            ...EMPTY_DATA.counts,
+            ...(result.counts || {}),
+          },
+
+          map: Array.isArray(result.map)
+            ? result.map
+            : [],
+
+          lidar: {
+            ...EMPTY_DATA.lidar,
+            ...(result.lidar || {}),
+          },
+        });
+
+        // VERY IMPORTANT:
+        // Allow the next frame only after the previous
+        // detection response has arrived.
+        processingFrameRef.current = false;
       } catch (error) {
-        console.error("Invalid WebSocket response:", error);
+        console.error(
+          "Could not parse backend response:",
+          error
+        );
 
-        processingRef.current = false;
+        processingFrameRef.current = false;
       }
     };
 
+    // ----------------------------------------------------------
+    // ERROR
+    // ----------------------------------------------------------
+
+    socket.onerror = (error) => {
+      console.error("========================================");
+      console.error("WebSocket ERROR");
+      console.error(error);
+      console.error("========================================");
+
+      setConnected(false);
+      processingFrameRef.current = false;
+    };
+
+    // ----------------------------------------------------------
+    // CLOSE
+    // ----------------------------------------------------------
+
     socket.onclose = (event) => {
-      console.log(
-        "WebSocket disconnected:",
+      console.warn(
+        "WebSocket disconnected.",
+        "Code:",
         event.code,
+        "Reason:",
         event.reason
       );
 
       connectingRef.current = false;
-      processingRef.current = false;
+      processingFrameRef.current = false;
 
       setConnected(false);
 
-      if (socketRef.current === socket) {
-        socketRef.current = null;
-      }
+      socketRef.current = null;
     };
+  }, [getWebSocketUrl]);
 
-    socket.onerror = (error) => {
-      console.error("WebSocket error:", error);
+  // ------------------------------------------------------------
+  // SEND ONE FRAME
+  // ------------------------------------------------------------
 
-      connectingRef.current = false;
-      processingRef.current = false;
-    };
-  }
+  const sendFrame = useCallback(() => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const socket = socketRef.current;
 
-  // ============================================================
-  // START CAMERA
-  // ============================================================
+    if (!video || !canvas) {
+      return;
+    }
 
-  async function startCamera() {
+    if (!socket) {
+      return;
+    }
+
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    if (!cameraStarted) {
+      return;
+    }
+
+    // Don't send another frame until the backend has
+    // finished processing the previous one.
+    if (processingFrameRef.current) {
+      return;
+    }
+
+    // Video must actually contain data.
+    if (
+      video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+      video.videoWidth <= 0 ||
+      video.videoHeight <= 0
+    ) {
+      return;
+    }
+
     try {
-      // Prevent starting twice
-      if (cameraStarted) {
-        console.log("Camera already started");
+      const width = 640;
+      const height = 360;
+
+      canvas.width = width;
+      canvas.height = height;
+
+      const context = canvas.getContext("2d", {
+        alpha: false,
+      });
+
+      if (!context) {
+        console.error("Could not get canvas context.");
         return;
       }
 
-      console.log("Requesting camera...");
+      // Draw current camera frame.
+      context.drawImage(
+        video,
+        0,
+        0,
+        width,
+        height
+      );
+
+      // Convert frame to JPEG.
+      const imageData = canvas.toDataURL(
+        "image/jpeg",
+        0.65
+      );
+
+      if (!imageData || imageData.length < 100) {
+        console.warn("Captured image appears to be empty.");
+        return;
+      }
+
+      // Mark frame as being processed.
+      processingFrameRef.current = true;
+
+      console.log(
+        "Sending frame:",
+        Math.round(imageData.length / 1024),
+        "KB"
+      );
+
+      socket.send(imageData);
+    } catch (error) {
+      console.error("Frame capture/send error:", error);
+
+      processingFrameRef.current = false;
+    }
+  }, [cameraStarted]);
+
+  // ------------------------------------------------------------
+  // START CAMERA
+  // ------------------------------------------------------------
+
+  const startCamera = useCallback(async () => {
+    try {
+      console.log("Requesting browser camera...");
+
+      // If an old camera stream exists, stop it first.
+      const oldStream = videoRef.current?.srcObject;
+
+      if (oldStream) {
+        oldStream
+          .getTracks()
+          .forEach((track) => track.stop());
+
+        videoRef.current.srcObject = null;
+      }
 
       const stream =
         await navigator.mediaDevices.getUserMedia({
@@ -179,203 +362,111 @@ export default function Home() {
           audio: false,
         });
 
-      streamRef.current = stream;
-
       if (!videoRef.current) {
-        console.error("Video element not available");
-
-        stream.getTracks().forEach((track) => {
-          track.stop();
-        });
+        stream
+          .getTracks()
+          .forEach((track) => track.stop());
 
         return;
       }
 
       videoRef.current.srcObject = stream;
 
+      videoRef.current.muted = true;
+      videoRef.current.playsInline = true;
+
       await videoRef.current.play();
 
+      console.log("========================================");
       console.log("Camera started");
+      console.log(
+        "Camera resolution:",
+        videoRef.current.videoWidth,
+        "x",
+        videoRef.current.videoHeight
+      );
+      console.log("========================================");
 
       setCameraStarted(true);
 
-      // Connect exactly one WebSocket
+      // Connect AFTER camera is ready.
       connectWebSocket();
-
     } catch (error) {
       console.error("Camera error:", error);
 
+      setCameraStarted(false);
+
       alert(
         "Could not access camera.\n\n" +
-        "Please allow camera permission in your browser."
+          "Please allow camera permission in your browser."
       );
     }
-  }
+  }, [connectWebSocket]);
 
-  // ============================================================
-  // SEND ONE FRAME
-  // ============================================================
-
-  function sendFrame() {
-    const socket = socketRef.current;
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-
-    // Basic checks
-    if (!cameraStarted) {
-      return;
-    }
-
-    if (!video || !canvas) {
-      return;
-    }
-
-    if (!socket) {
-      return;
-    }
-
-    if (socket.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    // IMPORTANT:
-    // Don't send another frame while YOLO is
-    // still processing the previous frame.
-    if (processingRef.current) {
-      return;
-    }
-
-    // Make sure video actually contains a frame
-    if (
-      video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
-      video.videoWidth === 0 ||
-      video.videoHeight === 0
-    ) {
-      return;
-    }
-
-    const ctx = canvas.getContext("2d");
-
-    if (!ctx) {
-      console.error("Could not get canvas context");
-      return;
-    }
-
-    canvas.width = 640;
-    canvas.height = 360;
-
-    // Draw current camera frame
-    ctx.drawImage(
-      video,
-      0,
-      0,
-      640,
-      360
-    );
-
-    // Convert to JPEG
-    const image = canvas.toDataURL(
-      "image/jpeg",
-      0.65
-    );
-
-    try {
-      // Mark as processing BEFORE sending
-      processingRef.current = true;
-
-      socket.send(image);
-
-    } catch (error) {
-      console.error(
-        "Failed to send frame:",
-        error
-      );
-
-      processingRef.current = false;
-    }
-  }
-
-  // ============================================================
-  // FRAME LOOP
-  // ============================================================
+  // ------------------------------------------------------------
+  // START FRAME LOOP
+  // ------------------------------------------------------------
 
   useEffect(() => {
     if (!cameraStarted) {
       return;
     }
 
-    console.log("Starting frame transmission...");
+    console.log("Starting detection frame loop...");
 
-    // Approximately 10 attempts/sec.
-    // Actual transmission is limited by processingRef.
-    const interval = setInterval(() => {
+    // 250 ms = maximum ~4 frames/sec sent.
+    //
+    // Because sendFrame() waits for the previous response,
+    // Render CPU will not get flooded with frames.
+    intervalRef.current = setInterval(() => {
       sendFrame();
-    }, 100);
+    }, 250);
 
     return () => {
-      console.log("Stopping frame transmission...");
-      clearInterval(interval);
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+
+      processingFrameRef.current = false;
+
+      console.log("Detection frame loop stopped.");
     };
+  }, [cameraStarted, sendFrame]);
 
-  }, [cameraStarted]);
-
-  // ============================================================
+  // ------------------------------------------------------------
   // CLEANUP
-  // ============================================================
+  // ------------------------------------------------------------
 
   useEffect(() => {
     return () => {
-      console.log("Cleaning up Home component...");
+      console.log("Cleaning up application...");
 
-      // Close WebSocket
-      if (socketRef.current) {
-        try {
-          socketRef.current.close();
-        } catch (error) {
-          console.error(
-            "WebSocket cleanup error:",
-            error
-          );
-        }
-
-        socketRef.current = null;
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
       }
 
-      // Stop camera
-      if (streamRef.current) {
-        streamRef.current
+      closeWebSocket();
+
+      const stream =
+        videoRef.current?.srcObject;
+
+      if (stream) {
+        stream
           .getTracks()
-          .forEach((track) => {
-            track.stop();
-          });
-
-        streamRef.current = null;
+          .forEach((track) => track.stop());
       }
 
-      // Also stop stream attached to video
       if (videoRef.current) {
-        const stream =
-          videoRef.current.srcObject;
-
-        if (stream) {
-          stream
-            .getTracks()
-            .forEach((track) => {
-              track.stop();
-            });
-        }
-
         videoRef.current.srcObject = null;
       }
-
-      processingRef.current = false;
-      connectingRef.current = false;
     };
-  }, []);
+  }, [closeWebSocket]);
 
-  // ============================================================
+  // ------------------------------------------------------------
   // UI
-  // ============================================================
+  // ------------------------------------------------------------
 
   return (
     <main className="container">
@@ -385,7 +476,6 @@ export default function Home() {
       ====================================================== */}
 
       <header className="header">
-
         <div>
           <h1>
             Adaptive 2.5D LiDAR Mapping
@@ -407,9 +497,7 @@ export default function Home() {
             ? "● SYSTEM ONLINE"
             : "● DISCONNECTED"}
         </div>
-
       </header>
-
 
       {/* ======================================================
           CAMERA
@@ -425,9 +513,10 @@ export default function Home() {
         />
 
         {/* Hidden canvas used to capture frames */}
-
         <canvas
           ref={canvasRef}
+          width={640}
+          height={360}
           style={{
             display: "none",
           }}
@@ -435,15 +524,11 @@ export default function Home() {
 
       </section>
 
-
       {/* ======================================================
           DASHBOARD
       ====================================================== */}
 
-      <Dashboard
-        data={data}
-      />
-
+      <Dashboard data={data} />
 
       {/* ======================================================
           2.5D MAP
@@ -453,7 +538,6 @@ export default function Home() {
         objects={data.map || []}
         lidar={data.lidar}
       />
-
 
       {/* ======================================================
           OBJECT LIST
@@ -466,4 +550,3 @@ export default function Home() {
     </main>
   );
 }
-```
